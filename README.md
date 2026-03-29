@@ -67,7 +67,7 @@ v2 achieves 1.3-2.3x speedup over v1 depending on sequence length.
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/turboquant-mlx.git
+git clone https://github.com/arozanov/turboquant-mlx.git
 cd turboquant-mlx
 pip install -e .
 ```
