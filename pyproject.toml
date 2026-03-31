@@ -4,19 +4,21 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "turboquant-mlx"
-version = "0.1.0"
+version = "0.2.0"
 description = "TurboQuant KV cache compression for MLX with fused Metal kernels"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
 dependencies = [
     "mlx>=0.20.0",
-    "mlx-lm>=0.20.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
+]
+mlx-lm = [
+    "mlx-lm>=0.20.0",
 ]
 
 [tool.setuptools.packages.find]
