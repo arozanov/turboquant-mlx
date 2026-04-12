@@ -6,6 +6,20 @@ Compresses transformer KV cache using PolarQuant (randomized Hadamard rotation +
 
 > **v0.3.0**: Critical bug fixes, Metal v4 pre-rotated query optimization, comprehensive test suite restoration. See [Recent Updates](#recent-updates-v03) below.
 
+## ⚠️ Important: Corrections Proposed Upstream
+
+This fork contains critical bug fixes and enhancements proposed to the original repository:
+
+| Status | Links |
+|--------|-------|
+| **Issues Opened** | [#5](https://github.com/arozanov/turboquant-mlx/issues/5) [#6](https://github.com/arozanov/turboquant-mlx/issues/6) [#7](https://github.com/arozanov/turboquant-mlx/issues/7) [#8](https://github.com/arozanov/turboquant-mlx/issues/8) [#9](https://github.com/arozanov/turboquant-mlx/issues/9) |
+| **PR Submitted** | [arozanov/turboquant-mlx#10](https://github.com/arozanov/turboquant-mlx/pull/10) |
+| **Status** | ⏳ Awaiting review |
+
+**Recommendation**:
+- 👉 **Use original repo** if you can wait for PR merge
+- 👉 **Use this fork** if you need fixes immediately (pip install from this fork)
+
 ## Recent Updates (v0.3.0) {#recent-updates-v03}
 
 ### Critical Bug Fixes
