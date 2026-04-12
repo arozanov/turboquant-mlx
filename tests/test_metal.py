@@ -2,13 +2,11 @@
 
 import mlx.core as mx
 import math
-import sys
 import time
 
-sys.path.insert(0, "/Users/antonrozanov/Projects/turboquant-money/turboquant-mlx")
-
 from turboquant_mlx.quantizer import PolarQuantizer
-from turboquant_mlx.metal_kernels import fused_dequantize, fused_attention_scores
+from turboquant_mlx.kernels import packed_dequantize, packed_fused_qk_scores
+from turboquant_mlx.packing import pack_indices, packed_dim
 
 
 def test_fused_dequant():
@@ -24,8 +22,9 @@ def test_fused_dequant():
     # Python path
     x_py = pq.dequantize(indices, norms)
 
-    # Metal path
-    x_metal = fused_dequantize(indices, norms, pq.centroids, pq.signs, dim)
+    # Metal path: pack indices first, then use packed_dequantize
+    packed = pack_indices(indices, bits)
+    x_metal = packed_dequantize(packed, norms, pq.centroids, pq.signs, dim, bits)
 
     mx.eval(x_py, x_metal)
 
@@ -39,31 +38,42 @@ def test_fused_dequant():
 def test_fused_attention():
     """Fused attention scores match naive compute."""
     dim = 128
-    seq_len = 256
+    n_heads = 4
+    seq_len = 64
     bits = 3
     pq = PolarQuantizer(dim, bits=bits)
 
-    # Simulate cached keys
-    keys = mx.random.normal(shape=(seq_len, dim))
-    k_indices, k_norms = pq.quantize(keys)
+    # Simulate cached keys per head
+    keys = mx.random.normal(shape=(n_heads, seq_len, dim))
+    k_packed_list = []
+    k_norms_list = []
+    for h in range(n_heads):
+        idx, nrm = pq.quantize(keys[h])
+        k_packed_list.append(pack_indices(idx, bits))
+        k_norms_list.append(nrm)
+
+    k_packed = mx.stack(k_packed_list)  # (n_heads, seq_len, packed_dim)
+    k_norms = mx.stack(k_norms_list)    # (n_heads, seq_len)
 
     # Single query
-    query = mx.random.normal(shape=(dim,))
+    query = mx.random.normal(shape=(n_heads, dim))
 
     # Naive: dequant then dot
-    keys_deq = pq.dequantize(k_indices, k_norms)
-    scores_naive = keys_deq @ query  # (seq_len,)
+    naive_scores = mx.zeros((n_heads, seq_len))
+    for h in range(n_heads):
+        idx, nrm = pq.quantize(keys[h])
+        k_deq = pq.dequantize(idx, nrm)
+        naive_scores[h] = k_deq @ query[h]
 
-    # Fused: indices → scores directly
-    scores_fused = fused_attention_scores(
-        query, k_indices, k_norms, pq.centroids, pq.signs, dim
+    # Fused: packed indices → scores directly
+    fused_scores = packed_fused_qk_scores(
+        query, k_packed, k_norms, pq.centroids, pq.signs, dim, bits
     )
+    mx.eval(naive_scores, fused_scores)
 
-    mx.eval(scores_naive, scores_fused)
-
-    error = mx.abs(scores_naive - scores_fused).max().item()
-    corr = mx.sum(scores_naive * scores_fused).item() / (
-        mx.linalg.norm(scores_naive).item() * mx.linalg.norm(scores_fused).item() + 1e-8
+    error = mx.abs(naive_scores - fused_scores).max().item()
+    corr = mx.sum(naive_scores * fused_scores).item() / (
+        mx.linalg.norm(naive_scores.reshape(-1)).item() * mx.linalg.norm(fused_scores.reshape(-1)).item() + 1e-8
     )
 
     print(f"  Fused attention: max_error={error:.6f}, correlation={corr:.6f}")
@@ -78,35 +88,37 @@ def test_fused_speed():
     pq = PolarQuantizer(dim, bits=bits)
 
     keys = mx.random.normal(shape=(seq_len, dim))
-    k_indices, k_norms = pq.quantize(keys)
+    indices, norms = pq.quantize(keys)
+    packed = pack_indices(indices, bits)
     query = mx.random.normal(shape=(dim,))
 
-    mx.eval(k_indices, k_norms, query)
+    mx.eval(packed, norms, query)
 
     # Warmup
     for _ in range(3):
-        _ = pq.dequantize(k_indices, k_norms)
+        _ = pq.dequantize(indices, norms)
         mx.eval(_)
-        _ = fused_attention_scores(query, k_indices, k_norms, pq.centroids, pq.signs, dim)
+        _ = packed_dequantize(packed, norms, pq.centroids, pq.signs, dim, bits)
         mx.eval(_)
 
-    # Naive path: dequant + matmul
+    # Naive path: Python dequant + matmul
     t0 = time.perf_counter()
     for _ in range(20):
-        deq = pq.dequantize(k_indices, k_norms)
+        deq = pq.dequantize(indices, norms)
         scores = deq @ query
         mx.eval(scores)
     naive_ms = (time.perf_counter() - t0) / 20 * 1000
 
-    # Fused path
+    # Metal path: packed dequant
     t0 = time.perf_counter()
     for _ in range(20):
-        scores = fused_attention_scores(query, k_indices, k_norms, pq.centroids, pq.signs, dim)
+        deq = packed_dequantize(packed, norms, pq.centroids, pq.signs, dim, bits)
+        scores = deq @ query
         mx.eval(scores)
-    fused_ms = (time.perf_counter() - t0) / 20 * 1000
+    metal_ms = (time.perf_counter() - t0) / 20 * 1000
 
-    speedup = naive_ms / fused_ms if fused_ms > 0 else 0
-    print(f"  seq_len={seq_len}: naive={naive_ms:.2f}ms, fused={fused_ms:.2f}ms, speedup={speedup:.2f}x")
+    speedup = naive_ms / metal_ms if metal_ms > 0 else 0
+    print(f"  seq_len={seq_len}: naive={naive_ms:.2f}ms, metal={metal_ms:.2f}ms, speedup={speedup:.2f}x")
 
 
 if __name__ == "__main__":

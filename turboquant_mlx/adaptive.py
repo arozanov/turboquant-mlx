@@ -51,6 +51,7 @@ def make_adaptive_cache(
             caches.append(KVCache())
         else:
             caches.append(TurboQuantKVCache(
-                bits=bits, k_bits=k_bits, v_bits=v_bits,
-                seed=seed, fused=fused))
+                bits=bits,
+                fused=fused,
+            ))
     return caches

@@ -129,6 +129,8 @@ def packed_dequantize(
     bits: int,
 ) -> mx.array:
     """Dequantize directly from packed uint32 storage via Metal."""
+    assert dim <= 256, f"Head dim {dim} exceeds Metal kernel shared memory limit of 256"
+    assert dim > 0 and (dim & (dim - 1)) == 0, f"Dim must be power of 2, got {dim}"
     global _packed_dequant
     if _packed_dequant is None:
         _packed_dequant = mx.fast.metal_kernel(
@@ -165,6 +167,8 @@ def packed_fused_qk_scores(
     bits: int,
 ) -> mx.array:
     """Fused Q@K^T reading directly from packed storage."""
+    assert dim <= 256, f"Head dim {dim} exceeds Metal kernel shared memory limit of 256"
+    assert dim > 0 and (dim & (dim - 1)) == 0, f"Dim must be power of 2, got {dim}"
     global _packed_fused_qk
     if _packed_fused_qk is None:
         _packed_fused_qk = mx.fast.metal_kernel(

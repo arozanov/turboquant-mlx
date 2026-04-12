@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """End-to-end: TurboQuant with fused attention on Qwen2.5-7B."""
 
-import sys
-sys.path.insert(0, "/Users/antonrozanov/Projects/turboquant-money/turboquant-mlx")
-
 import mlx.core as mx
 import time
 

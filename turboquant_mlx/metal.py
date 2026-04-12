@@ -163,6 +163,8 @@ def fused_quantize(
     Returns:
         (packed, norms): packed uint32 (n_vecs, packed_dim), norms float32 (n_vecs,)
     """
+    assert dim <= 256, f"Head dim {dim} exceeds Metal kernel shared memory limit of 256"
+    assert dim > 0 and (dim & (dim - 1)) == 0, f"Dim must be power of 2, got {dim}"
     global _fused_quantize_kernel
     if _fused_quantize_kernel is None:
         _fused_quantize_kernel = mx.fast.metal_kernel(
@@ -205,6 +207,8 @@ def dequant_fp16(
     bits: int,
 ) -> mx.array:
     """Dequantize from packed to fp16 directly (no float32 intermediate)."""
+    assert dim <= 256, f"Head dim {dim} exceeds Metal kernel shared memory limit of 256"
+    assert dim > 0 and (dim & (dim - 1)) == 0, f"Dim must be power of 2, got {dim}"
     global _dequant_fp16_kernel
     if _dequant_fp16_kernel is None:
         _dequant_fp16_kernel = mx.fast.metal_kernel(

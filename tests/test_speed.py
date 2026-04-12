@@ -1,12 +1,10 @@
 """Speed comparison: Python vs Metal dequant in cache context."""
 
-import sys
-sys.path.insert(0, "/Users/antonrozanov/Projects/turboquant-money/turboquant-mlx")
-
 import mlx.core as mx
 import time
 from turboquant_mlx.quantizer import PolarQuantizer
-from turboquant_mlx.metal_kernels import fused_dequantize
+from turboquant_mlx.kernels import packed_dequantize
+from turboquant_mlx.packing import pack_indices
 
 
 def bench_dequant(seq_len, dim=128, bits=3, n_iters=50):
@@ -14,13 +12,14 @@ def bench_dequant(seq_len, dim=128, bits=3, n_iters=50):
     pq = PolarQuantizer(dim, bits=bits)
     x = mx.random.normal(shape=(seq_len, dim))
     indices, norms = pq.quantize(x)
-    mx.eval(indices, norms)
+    packed = pack_indices(indices, bits)
+    mx.eval(indices, norms, packed)
 
     # Warmup
     for _ in range(5):
         _ = pq.dequantize(indices, norms)
         mx.eval(_)
-        _ = fused_dequantize(indices, norms, pq.centroids, pq.signs, dim)
+        _ = packed_dequantize(packed, norms, pq.centroids, pq.signs, dim, bits)
         mx.eval(_)
 
     # Python path
@@ -33,7 +32,7 @@ def bench_dequant(seq_len, dim=128, bits=3, n_iters=50):
     # Metal path
     t0 = time.perf_counter()
     for _ in range(n_iters):
-        out_metal = fused_dequantize(indices, norms, pq.centroids, pq.signs, dim)
+        out_metal = packed_dequantize(packed, norms, pq.centroids, pq.signs, dim, bits)
         mx.eval(out_metal)
     metal_ms = (time.perf_counter() - t0) / n_iters * 1000
 
@@ -46,12 +45,12 @@ def bench_full_cache_cycle(seq_len, n_heads=32, dim=128, bits=3, n_iters=20):
     from turboquant_mlx.cache import TurboQuantKVCache
 
     # Fill cache to seq_len
-    cache_metal = TurboQuantKVCache(bits=bits)
+    cache = TurboQuantKVCache(bits=bits)
     B = 1
     keys = mx.random.normal(shape=(B, n_heads, seq_len, dim))
     vals = mx.random.normal(shape=(B, n_heads, seq_len, dim))
-    cache_metal.update_and_fetch(keys, vals)
-    mx.eval(cache_metal.k_indices)
+    cache.update_and_fetch(keys, vals)
+    mx.eval(cache.k_packed)
 
     # Simulate decode steps
     new_k = mx.random.normal(shape=(B, n_heads, 1, dim))
@@ -60,17 +59,16 @@ def bench_full_cache_cycle(seq_len, n_heads=32, dim=128, bits=3, n_iters=20):
 
     # Warmup
     for _ in range(3):
-        # Reset offset to simulate repeated decode
-        cache_metal.offset = seq_len
-        out_k, out_v = cache_metal.update_and_fetch(new_k, new_v)
+        cache.offset = seq_len
+        out_k, out_v = cache.update_and_fetch(new_k, new_v)
         mx.eval(out_k, out_v)
 
     # Benchmark: Metal cache decode
     times = []
     for _ in range(n_iters):
-        cache_metal.offset = seq_len
+        cache.offset = seq_len
         t0 = time.perf_counter()
-        out_k, out_v = cache_metal.update_and_fetch(new_k, new_v)
+        out_k, out_v = cache.update_and_fetch(new_k, new_v)
         mx.eval(out_k, out_v)
         times.append(time.perf_counter() - t0)
     metal_ms = sum(times) / len(times) * 1000

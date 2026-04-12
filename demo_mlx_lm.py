@@ -6,9 +6,6 @@ Downloads a small model and runs generation with TurboQuant KV cache,
 comparing memory and quality against default cache.
 """
 
-import sys
-sys.path.insert(0, "/Users/antonrozanov/Projects/turboquant-money/turboquant-mlx")
-
 import mlx.core as mx
 import time
 

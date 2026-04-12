@@ -8,5 +8,12 @@ from turboquant_mlx.rotation import (
     inverse_randomized_hadamard,
     random_diagonal_sign,
 )
+from turboquant_mlx.sparse_v import topk_sparse_v, count_active_positions
+from turboquant_mlx.fused_attention import turboquant_attention
+from turboquant_mlx.metal_kernels_v4 import (
+    prerotate_query,
+    prerot_fused_qk_scores,
+    prerot_packed_dequantize,
+)
 
 __version__ = "0.2.0"

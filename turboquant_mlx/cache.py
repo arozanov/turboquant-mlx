@@ -12,6 +12,11 @@ from turboquant_mlx.packing import pack_indices, unpack_indices, packed_dim, VAL
 from turboquant_mlx.metal import fused_quantize, dequant_fp16
 from turboquant_mlx.kernels import packed_dequantize
 
+try:
+    from mlx_lm.models.base import create_attention_mask as _create_attention_mask
+except ImportError:
+    _create_attention_mask = None
+
 
 def _compute_gaussian_codebook(bits):
     codebooks = {
@@ -52,9 +57,10 @@ class TurboQuantKVCache:
 
     step = 256
 
-    def __init__(self, bits: int = 3, seed: int = 42):
+    def __init__(self, bits: int = 3, seed: int = 42, fused: bool = False):
         self.quant_bits = bits
         self.seed = seed
+        self.fused = fused
         self.offset = 0
 
         self.k_packed = None
@@ -175,6 +181,18 @@ class TurboQuantKVCache:
                 self.k_norms[..., :self.offset].nbytes + self.v_norms[..., :self.offset].nbytes)
 
     @property
+    def compression_ratio(self):
+        """Compression ratio vs FP16 baseline."""
+        if self.k_packed is None or self.offset == 0 or self._k_dim is None:
+            return 1.0
+        B, H = self.k_packed.shape[0], self.k_packed.shape[1]
+        fp16_bytes = B * H * self.offset * (self._k_dim + self._v_dim) * 2
+        actual_bytes = self.nbytes
+        if actual_bytes == 0:
+            return 1.0
+        return fp16_bytes / actual_bytes
+
+    @property
     def state(self):
         if self.k_packed is None:
             return []
@@ -226,9 +244,22 @@ class TurboQuantKVCache:
     def size(self):
         return self.offset
 
-    def make_mask(self, *args, **kwargs):
-        # create_attention_mask not available in standalone mode
-        return create_attention_mask(*args, offset=self.offset, **kwargs)
+    @property
+    def _k_quantizer(self):
+        return self._k_q
+
+    @property
+    def _v_quantizer(self):
+        return self._v_q
+
+    def make_mask(self, h, window_size=None, return_array=False):
+        if _create_attention_mask is None:
+            raise ImportError(
+                "mlx_lm is required for make_mask. Install with: pip install mlx-lm"
+            )
+        return _create_attention_mask(
+            h, cache=self, window_size=window_size, return_array=return_array
+        )
 
     @classmethod
     def from_state(cls, state, meta_state):
@@ -248,6 +279,7 @@ class TurboQuantKVCache:
         obj._k_pdim = None
         obj._v_pdim = None
         obj._dtype = None
+        obj.fused = False
         obj.meta_state = meta_state
         obj.state = state
         return obj

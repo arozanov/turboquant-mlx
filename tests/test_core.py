@@ -1,8 +1,6 @@
 """Tests for TurboQuant MLX core components."""
 
 import mlx.core as mx
-import sys
-sys.path.insert(0, "/Users/antonrozanov/Projects/turboquant-money/turboquant-mlx")
 
 from turboquant_mlx.rotation import (
     walsh_hadamard_transform,
@@ -157,10 +155,7 @@ def test_cache_compression():
     cache.update_and_fetch(keys, vals)
 
     ratio = cache.compression_ratio
-    # Phase 1 stores uint8 (8 bits) not packed 3-bit, so ratio is ~2x not ~4.6x
-    # Effective ratio with bit packing would be: 16 / (3 + norm_overhead) ≈ 4.6x
-    effective_ratio = (B * H * S * D * 2) / (B * H * S * D * (cache.quant_bits / 8) + B * H * S * 4)
-    print(f"  Storage ratio: {ratio:.1f}x (uint8), effective with packing: {effective_ratio:.1f}x")
+    print(f"  Compression ratio: {ratio:.1f}x")
     assert ratio > 1.5, f"Compression ratio too low: {ratio}"
 
 
