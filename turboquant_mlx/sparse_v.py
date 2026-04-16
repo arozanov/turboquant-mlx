@@ -32,6 +32,16 @@ import mlx.core as mx
 SPARSE_V_KERNEL = """
     // One threadgroup per Q head; `dim` threads cooperate on the butterfly.
     // GQA: V is indexed by kv_head = q_head / n_rep, weights by q_head.
+    //
+    // An earlier redesign tried one threadgroup per kv_head so the butterfly
+    // runs once per kv_head and scatters into n_rep Q heads (saves ~n_rep
+    // worth of butterfly work and DRAM traffic). On real Qwen-class GQA
+    // models that made things worse: n_kv_heads is small (4..8), so the
+    // kernel becomes under-utilized (only 4..8 threadgroups on a GPU that
+    // can host dozens), and the shared threshold check (max-of-n_rep)
+    // drops fewer positions than per-Q-head. We keep the per-Q-head
+    // design here and note GQA sharing as future work. See the blog post
+    // for the measurements that led to this decision.
     uint head = threadgroup_position_in_grid.x;   // q_head
     uint elem = thread_position_in_threadgroup.x;
     uint dim = dims[0];
