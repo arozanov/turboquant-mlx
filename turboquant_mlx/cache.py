@@ -251,13 +251,27 @@ class TurboQuantKVCache:
     def size(self):
         return self.offset
 
-    def make_mask(self, *args, **kwargs):
-        if create_attention_mask is None:
-            raise RuntimeError(
-                "make_mask requires mlx-lm; install it to use TurboQuantKVCache "
-                "with mlx_lm model code"
-            )
-        return create_attention_mask(*args, offset=self.offset, **kwargs)
+    def make_mask(self, N, return_array: bool = False, window_size=None):
+        """Build the attention mask for a forward of length ``N`` tokens.
+
+        Matches the contract the mlx_lm model code expects: called from
+        create_attention_mask(h, cache) for the first cache layer, must
+        return None (implicit causal) for single-token decode, "causal"
+        string for multi-token without explicit array, or an explicit
+        offset-aware causal array when the caller asks for one.
+
+        Mirrors mlx_lm.models.base.create_attention_mask's logic without
+        invoking it (upstream mlx_lm.cache.KVCache.make_mask forwards
+        offset=self.offset, but the current create_attention_mask
+        signature no longer accepts that kwarg in this fork).
+        """
+        from mlx_lm.models.base import create_causal_mask
+
+        if N == 1:
+            return None
+        if return_array or (window_size is not None and N > window_size):
+            return create_causal_mask(N, offset=self.offset, window_size=window_size)
+        return "causal"
 
     @classmethod
     def from_state(cls, state, meta_state):
