@@ -12,6 +12,11 @@ from turboquant_mlx.packing import pack_indices, unpack_indices, packed_dim, VAL
 from turboquant_mlx.metal import fused_quantize, dequant_fp16
 from turboquant_mlx.kernels import packed_dequantize
 
+try:
+    from mlx_lm.models.base import create_attention_mask
+except ImportError:  # standalone usage without mlx-lm installed
+    create_attention_mask = None
+
 
 def _compute_gaussian_codebook(bits):
     codebooks = {
@@ -227,7 +232,11 @@ class TurboQuantKVCache:
         return self.offset
 
     def make_mask(self, *args, **kwargs):
-        # create_attention_mask not available in standalone mode
+        if create_attention_mask is None:
+            raise RuntimeError(
+                "make_mask requires mlx-lm; install it to use TurboQuantKVCache "
+                "with mlx_lm model code"
+            )
         return create_attention_mask(*args, offset=self.offset, **kwargs)
 
     @classmethod
