@@ -79,21 +79,27 @@ FLASH_ATTN_KERNEL = """
     for (uint bstart = 0; bstart < seq_len; bstart += B_c) {
         uint bsize = min(B_c, seq_len - bstart);
 
-        // Phase 1: compute bsize Q@K scores using prerotated Q.
+        // Phase 1: compute bsize Q@K scores using prerotated Q. Each
+        // score is a dim-wide reduction; use simd_sum + one cross-simd
+        // barrier instead of a full log(dim) tree reduction.
+        threadgroup T simd_sums[8];   // supports dim up to 256
+        uint simd_id = elem / 32;
+        uint lane_id = elem % 32;
+        uint n_simds = dim / 32;
         for (uint b = 0; b < bsize; b++) {
             uint pos = bstart + b;
             uint k_word_idx = elem / k_vpw;
             uint k_pos_in_word = elem % k_vpw;
             uint word = k_packed[kv_head * seq_len * k_pdim + pos * k_pdim + k_word_idx];
             uint idx = (word >> (k_pos_in_word * bits)) & bit_mask;
-            bfly[elem] = k_centroids[idx] * q_elem;
+            T part = k_centroids[idx] * q_elem;
+            T simd_part = simd_sum(part);
+            if (lane_id == 0) simd_sums[simd_id] = simd_part;
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint stride = dim / 2; stride > 0; stride >>= 1) {
-                if (elem < stride) bfly[elem] += bfly[elem + stride];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
             if (elem == 0) {
-                scores[b] = bfly[0] * k_norms[kv_head * seq_len + pos]
+                T total = (T)0;
+                for (uint i = 0; i < n_simds; i++) total += simd_sums[i];
+                scores[b] = total * k_norms[kv_head * seq_len + pos]
                             * inv_dim * attn_scale;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);

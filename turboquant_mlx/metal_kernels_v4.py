@@ -91,20 +91,24 @@ PREROT_FUSED_QK_KERNEL = """
     // Partial product with the pre-rotated query — no butterfly here.
     T partial = centroids[idx] * q_rot[head * dim + elem];
 
-    // Tree reduction across the `dim` threads of this threadgroup.
-    threadgroup T shared[256];
-    shared[elem] = partial;
+    // Reduce across the `dim` threads using simd_sum instead of a full
+    // log(dim) tree reduction through shared memory. simd_sum sums all
+    // 32 lanes in a SIMD group in one instruction with no barrier; we
+    // then stitch together the (dim / 32) SIMD-group partials through
+    // a single threadgroup barrier. On dim=128 this goes from 7 barriers
+    // to 1.
+    T simd_part = simd_sum(partial);
+    threadgroup T simd_sums[8];   // supports dim up to 256
+    uint simd_id = elem / 32;
+    uint lane_id = elem % 32;
+    if (lane_id == 0) simd_sums[simd_id] = simd_part;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint stride = dim / 2; stride > 0; stride >>= 1) {
-        if (elem < stride) {
-            shared[elem] += shared[elem + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
     if (elem == 0) {
-        out[head * seq_len + pos] = shared[0] * norms[kv_head * seq_len + pos] * scale[0];
+        T total = (T)0;
+        uint n_simds = dim / 32;
+        for (uint i = 0; i < n_simds; i++) total += simd_sums[i];
+        out[head * seq_len + pos] = total * norms[kv_head * seq_len + pos] * scale[0];
     }
 """
 
