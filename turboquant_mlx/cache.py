@@ -183,6 +183,23 @@ class TurboQuantKVCache:
                 self.k_norms[..., :self.offset].nbytes + self.v_norms[..., :self.offset].nbytes)
 
     @property
+    def compression_ratio(self) -> float:
+        """FP16 bytes of the uncompressed K+V that produced this cache divided
+        by the actual bytes of the packed + norm storage.
+
+        Returns 1.0 for an empty cache. Used by benchmarks and
+        tests/test_core.py::test_cache_compression.
+        """
+        total = self.nbytes
+        if self.k_packed is None or total == 0:
+            return 1.0
+        B, H = self.k_packed.shape[0], self.k_packed.shape[1]
+        k_dim = self._k_dim or 0
+        v_dim = self._v_dim or 0
+        fp16_bytes = B * H * self.offset * (k_dim + v_dim) * 2
+        return fp16_bytes / total
+
+    @property
     def state(self):
         if self.k_packed is None:
             return []
