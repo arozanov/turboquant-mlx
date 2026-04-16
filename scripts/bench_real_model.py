@@ -22,7 +22,7 @@ import gc
 import time
 
 import mlx.core as mx
-from mlx_lm import generate, load
+from mlx_lm import load, stream_generate
 from mlx_lm.sample_utils import make_sampler
 
 from turboquant_mlx.cache import TurboQuantKVCache
@@ -62,20 +62,28 @@ def _decode_tok_per_sec(model, tokenizer, prompt, max_tokens, prompt_cache):
 
 
 def _run_generate(model, tokenizer, prompt, max_tokens, prompt_cache):
+    """Return (prompt_tps, generation_tps, peak_memory_gb, n_tokens).
+
+    Uses stream_generate so we can split prefill from decode and avoid
+    mixing the two into a single wall-clock number — decode-only tok/sec
+    is the metric that actually reflects attention-path performance.
+    """
     sampler = make_sampler(temp=0.0)
-    t0 = time.perf_counter()
-    text = generate(
+    last = None
+    n = 0
+    for resp in stream_generate(
         model,
         tokenizer,
         prompt=prompt,
         max_tokens=max_tokens,
         sampler=sampler,
         prompt_cache=prompt_cache,
-        verbose=False,
-    )
-    elapsed = time.perf_counter() - t0
-    tokens_out = len(tokenizer.encode(text)) if text else 0
-    return elapsed, tokens_out, text
+    ):
+        last = resp
+        n += 1
+    if last is None:
+        return 0.0, 0.0, 0.0, 0
+    return last.prompt_tps, last.generation_tps, last.peak_memory, n
 
 
 def bench_baseline(model, tokenizer, prompt, max_tokens):
@@ -96,11 +104,14 @@ def bench_turboquant(
 ):
     # Fresh cache per run — avoids pollution across modes.
     n_layers = len(model.model.layers)
-    cache = [TurboQuantKVCache(bits=bits, fused=fused) for _ in range(n_layers)]
+    cache = [
+        TurboQuantKVCache(
+            bits=bits, fused=fused, sparse_v_threshold=sparse_v_threshold
+        )
+        for _ in range(n_layers)
+    ]
     if fused:
         apply_patch()
-    # sparse_v_threshold is not yet threaded through patch.py — noted as TODO
-    # below. For now the fused path without sparse V runs end-to-end.
     try:
         return _run_generate(model, tokenizer, prompt, max_tokens, cache)
     finally:
@@ -125,22 +136,57 @@ def main():
     actual_prompt_tokens = len(tokenizer.encode(prompt))
     print(f"Prompt tokens: {actual_prompt_tokens}, max new tokens: {args.max_tokens}")
 
-    print()
-    print("=== A: mlx-lm default KV cache (fp16 baseline) ===")
-    t_a, toks_a, _ = bench_baseline(model, tokenizer, prompt, args.max_tokens)
-    tps_a = toks_a / t_a if t_a > 0 else 0
-    print(f"  wall={t_a:.2f}s tokens={toks_a} tok/sec={tps_a:.2f}")
-    gc.collect()
-    mx.metal.clear_cache()
+    def _line(label, prompt_tps, gen_tps, mem_gb, n):
+        print(
+            f"  {label:<50s} "
+            f"prefill={prompt_tps:7.1f} tok/s  "
+            f"decode={gen_tps:6.2f} tok/s  "
+            f"peak={mem_gb:5.2f} GB  n={n}"
+        )
 
     print()
-    print(f"=== B: TurboQuant (bits={args.bits}, fused prerot Q, no sparse V) ===")
-    t_b, toks_b, _ = bench_turboquant(
+    print("=== A: mlx-lm default KV cache (fp16 baseline) ===")
+    p_a, g_a, m_a, n_a = bench_baseline(
+        model, tokenizer, prompt, args.max_tokens
+    )
+    _line("baseline", p_a, g_a, m_a, n_a)
+    gc.collect()
+    mx.clear_cache()
+
+    print()
+    print(f"=== B: TurboQuant (bits={args.bits}, compressed KV, Apple SDPA) ===")
+    p_b, g_b, m_b, n_b = bench_turboquant(
+        model, tokenizer, prompt, args.max_tokens,
+        bits=args.bits, fused=False, sparse_v_threshold=None,
+    )
+    _line(f"turboquant-{args.bits}b no-fuse", p_b, g_b, m_b, n_b)
+    gc.collect()
+    mx.clear_cache()
+
+    print()
+    print(f"=== C: TurboQuant (bits={args.bits}, fused prerot Q) ===")
+    p_c, g_c, m_c, n_c = bench_turboquant(
         model, tokenizer, prompt, args.max_tokens,
         bits=args.bits, fused=True, sparse_v_threshold=None,
     )
-    tps_b = toks_b / t_b if t_b > 0 else 0
-    print(f"  wall={t_b:.2f}s tokens={toks_b} tok/sec={tps_b:.2f}")
+    _line(f"turboquant-{args.bits}b fused", p_c, g_c, m_c, n_c)
+    gc.collect()
+    mx.clear_cache()
+
+    print()
+    print(f"=== D: TurboQuant (bits={args.bits}, fused + sparse V 1e-5) ===")
+    p_d, g_d, m_d, n_d = bench_turboquant(
+        model, tokenizer, prompt, args.max_tokens,
+        bits=args.bits, fused=True, sparse_v_threshold=1e-5,
+    )
+    _line(f"turboquant-{args.bits}b fused+sparse", p_d, g_d, m_d, n_d)
+
+    print()
+    print("=== Summary ===")
+    if g_a > 0:
+        print(f"  decode speedup B/A: {g_b / g_a:.2f}x  C/A: {g_c / g_a:.2f}x  D/A: {g_d / g_a:.2f}x")
+    if m_a > 0:
+        print(f"  peak-memory ratio B/A: {m_b / m_a:.2f}  C/A: {m_c / m_a:.2f}  D/A: {m_d / m_a:.2f}")
 
 
 if __name__ == "__main__":

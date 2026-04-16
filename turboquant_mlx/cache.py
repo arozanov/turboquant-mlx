@@ -57,13 +57,22 @@ class TurboQuantKVCache:
 
     step = 256
 
-    def __init__(self, bits: int = 3, seed: int = 42, fused: bool = False):
+    def __init__(
+        self,
+        bits: int = 3,
+        seed: int = 42,
+        fused: bool = False,
+        sparse_v_threshold: float | None = None,
+    ):
         self.quant_bits = bits
         self.seed = seed
         self.offset = 0
         # Opt-in flag read by the fused SDPA monkey-patch (turboquant_mlx.patch);
         # decoupled from cache data, so it is not persisted in state/meta_state.
         self.fused = fused
+        # Sparse V threshold (see sparse_v.sparse_v_matvec). None -> dense V
+        # path via prerot_packed_dequantize. Only consulted when fused is True.
+        self.sparse_v_threshold = sparse_v_threshold
 
         self.k_packed = None
         self.k_norms = None
@@ -142,6 +151,18 @@ class TurboQuantKVCache:
         self.v_norms[..., prev:prev+S] = v_nrm.reshape(B, H, S)
         self.offset += S
         total = self.offset
+
+        # Lazy-V fast path: when the fused attention path is active, the
+        # downstream SDPA is patched to read K/V directly from the packed
+        # storage (prerot_fused_qk_scores + sparse_v_matvec), so the K/V
+        # dequant buffer is dead weight — we'd pay the dequant cost and
+        # the write bandwidth for nothing. Skip both and return empty
+        # placeholders of the correct shape; MLX keeps them lazy, and the
+        # patched SDPA never materializes them.
+        if self.fused:
+            placeholder_k = mx.zeros((B, H, total, k_dim), dtype=keys.dtype)
+            placeholder_v = mx.zeros((B, H, total, v_dim), dtype=values.dtype)
+            return placeholder_k, placeholder_v
 
         # Incremental decode
         if S <= 4 and self._v_deq_buf is not None and self._deq_offset == prev:
@@ -291,9 +312,10 @@ class TurboQuantKVCache:
         obj._k_pdim = None
         obj._v_pdim = None
         obj._dtype = None
-        # fused is a runtime flag, not persisted in state/meta_state;
-        # callers that need the fused path must re-enable it after load.
+        # fused and sparse_v_threshold are runtime flags, not persisted in
+        # state/meta_state; callers that need them must set them after load.
         obj.fused = False
+        obj.sparse_v_threshold = None
         obj.meta_state = meta_state
         obj.state = state
         return obj

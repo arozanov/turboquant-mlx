@@ -21,8 +21,14 @@ def _patched_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
     is_tq = isinstance(cache, TurboQuantKVCache) and cache.offset > 0 and cache.fused
 
     if is_decode and is_tq:
-        # Pass V from arguments (decode buffer) to avoid re-dequanting
-        return turboquant_attention(queries, cache, scale, mask, v_buffer=values)
+        # Ignore the `keys`/`values` args: when cache.fused is on, update_and_fetch
+        # returns empty placeholders (see cache.py lazy-V fast path). Route
+        # directly through turboquant_attention, which reads packed K/V from
+        # the cache and optionally skips V dequant via sparse_v_matvec.
+        return turboquant_attention(
+            queries, cache, scale, mask,
+            sparse_v_threshold=cache.sparse_v_threshold,
+        )
     elif hasattr(cache, "bits"):
         # Original quantized path
         from mlx_lm.models.base import quantized_scaled_dot_product_attention
