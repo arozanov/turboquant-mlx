@@ -1,22 +1,36 @@
-"""Sparse V dequant: skip dequantization for positions with negligible attention weight.
+"""Sparse V attention: skip WHT+dequant for positions with negligible weight.
 
-After softmax, 90%+ of attention weights are < 1e-6 at long context.
-Instead of dequantizing ALL V vectors and doing weights @ V,
-only dequantize V where weight > threshold.
+After softmax, the tail of attention weights is heavy: at long context,
+most positions contribute < 1e-5 to the weighted sum over V. Running a
+full O(d log d) WHT butterfly for every cached V vector is wasted work
+when the result will be scaled by a near-zero weight.
 
-Saves ~90% of V dequant cost at long context. Zero quality loss
-since skipped positions contribute < 1e-6 to the output.
+This module replaces the v0 kernel (which stubbed the butterfly and was
+never wired) with a correct one:
 
-Metal kernel: reads attention weights, packed V, and codebook.
-Only dequants and accumulates V where weight exceeds threshold.
+  - One threadgroup per attention head, `dim` threads.
+  - For each cached position, all threads coherently check the weight.
+    Positions with weight below `threshold` are skipped — no packed load,
+    no butterfly, no accumulate.
+  - For active positions, the threadgroup cooperatively runs the raw WHT
+    butterfly on the position's codebook values (same butterfly used in
+    packed_dequantize) and accumulates weight * butterfly_elem *
+    v_norms[pos].
+  - At the end, signs and the 1/sqrt(d) scale are applied once per
+    output element (pulled out of the inner loop since they are constant
+    per-element across positions).
+
+Correctness anchor: with `threshold = 0.0` the kernel must produce the
+same result as the dense path (weights @ packed_dequantize(v)) up to
+float32 noise. That is the test pinned in tests/test_sparse_v.py.
 """
 
-import mlx.core as mx
 import math
 
+import mlx.core as mx
+
 SPARSE_V_KERNEL = """
-    // Thread computes one element of the output vector
-    // For each seq position: check weight, if > threshold: dequant V and accumulate
+    // One threadgroup per head; `dim` threads cooperate on the butterfly.
     uint head = threadgroup_position_in_grid.x;
     uint elem = thread_position_in_threadgroup.x;
     uint dim = dims[0];
@@ -26,73 +40,140 @@ SPARSE_V_KERNEL = """
     uint packed_dim = dims[4];
     uint bit_mask = (1u << bits) - 1u;
 
-    float acc = 0.0f;
+    threadgroup T shared[256];
+    T acc = (T)0;
+
+    // Position loop runs on every thread coherently — `continue` below is
+    // taken by the whole threadgroup (weight is a scalar), so the barriers
+    // inside the butterfly stay well-defined.
     uint v_base = head * seq_len * packed_dim;
-
     for (uint pos = 0; pos < seq_len; pos++) {
-        float w = weights[head * seq_len + pos];
-
-        // Skip negligible weights
+        T w = weights[head * seq_len + pos];
         if (w < threshold[0]) continue;
 
-        // Dequant this V element from packed storage
+        // Unpack this thread's V codebook index for this position.
         uint word_idx = elem / vals_per_word;
         uint pos_in_word = elem % vals_per_word;
         uint word = v_packed[v_base + pos * packed_dim + word_idx];
         uint idx = (word >> (pos_in_word * bits)) & bit_mask;
-        float v_val = centroids[idx] * scale[0];
 
-        // WHT butterfly would go here but we need ALL elements for that.
-        // Instead: store raw codebook value, apply WHT correction later.
-        // For now: accumulate raw codebook * weight (approximate, no WHT)
-        // TODO: full sparse V with WHT needs threadgroup cooperation
+        shared[elem] = centroids[idx];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        acc += w * v_val * norms[head * seq_len + pos] * scale[0];
+        // In-place raw WHT butterfly over the `dim` codebook values held
+        // by this threadgroup (matches kernels.PACKED_DEQUANT_KERNEL).
+        uint h = 1;
+        while (h < dim) {
+            uint block = elem / (2 * h);
+            uint offset = elem % (2 * h);
+            if (offset < h) {
+                uint j = block * 2 * h + offset;
+                T a = shared[j];
+                T b = shared[j + h];
+                shared[j]     = a + b;
+                shared[j + h] = a - b;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            h *= 2;
+        }
+
+        // Weight * butterfly_elem * v_norm[pos]. signs and 1/sqrt(d) are
+        // constants in `elem` — apply once after the loop.
+        acc += w * shared[elem] * norms[head * seq_len + pos];
     }
 
-    out[head * dim + elem] = acc;
+    out[head * dim + elem] = acc * signs[elem] * scale[0];
 """
 
-# Simpler approach: just mask the weights and use standard matmul
-def topk_sparse_v(
-    weights: mx.array,
-    v_deq: mx.array,
-    k: int = 256,
-) -> mx.array:
-    """Top-K sparse V: only use K highest-weighted positions.
 
-    Instead of (1, seq_len) @ (seq_len, dim), does (1, K) @ (K, dim).
-    At 8K context with K=256, this is a 32x smaller matmul.
+_sparse_v_matvec = None
+
+
+def sparse_v_matvec(
+    weights: mx.array,
+    v_packed: mx.array,
+    v_norms: mx.array,
+    centroids: mx.array,
+    signs: mx.array,
+    dim: int,
+    bits: int,
+    threshold: float = 1e-5,
+) -> mx.array:
+    """Sparse weighted sum of dequanted V vectors.
+
+    Equivalent to `weights @ packed_dequantize(v_packed, v_norms, ...)`
+    when `threshold == 0.0`. When threshold > 0, positions with
+    weight < threshold are silently dropped from the sum — the
+    contribution they would have made is bounded by
+    `threshold * max_norm * max_codebook` per skipped position, so the
+    total error is bounded by `seq_len * threshold * max_contribution`.
 
     Args:
-        weights: (n_heads, seq_len) attention weights after softmax
-        v_deq: (n_heads, seq_len, dim) dequantized V
-        k: number of top positions to keep
+        weights: (n_heads, seq_len) post-softmax attention weights.
+        v_packed: (n_heads, seq_len, packed_dim) uint32 packed indices.
+        v_norms: (n_heads, seq_len) per-position V vector norms.
+        centroids: (n_levels,) Lloyd-Max centroids.
+        signs: (dim,) ±1 rotation signs (same convention as the encoder).
+        dim: head dimension (power of 2, <= 256).
+        bits: quantization bit width (1-4).
+        threshold: minimum weight to compute; <= 0 means dense.
 
     Returns:
-        (n_heads, 1, dim) weighted sum
+        (n_heads, dim) weighted sum.
     """
+    global _sparse_v_matvec
+    if _sparse_v_matvec is None:
+        _sparse_v_matvec = mx.fast.metal_kernel(
+            name="tq_sparse_v_matvec",
+            input_names=[
+                "weights",
+                "v_packed",
+                "norms",
+                "centroids",
+                "signs",
+                "scale",
+                "threshold",
+                "dims",
+            ],
+            output_names=["out"],
+            source=SPARSE_V_KERNEL,
+        )
+
+    if dim & (dim - 1):
+        raise ValueError(f"dim must be a power of 2, got {dim}")
+    if dim > 256:
+        raise ValueError(f"dim > 256 not supported by threadgroup layout, got {dim}")
+
     n_heads, seq_len = weights.shape
-    if seq_len <= k:
-        return weights[:, None, :] @ v_deq
+    p_dim = v_packed.shape[-1]
+    vpw = {1: 32, 2: 16, 3: 10, 4: 8}[bits]
+    # Total scale is 1/dim: packed_dequantize applies 1/sqrt(d) twice
+    # (once on codebook before the butterfly, once on the result). We
+    # apply it once at the end — same total, one multiply.
+    scale = mx.array([1.0 / dim], dtype=mx.float32)
+    thr = mx.array([max(threshold, 0.0)], dtype=mx.float32)
+    dims_arr = mx.array([dim, seq_len, bits, vpw, p_dim], dtype=mx.uint32)
 
-    # Get top-K indices per head
-    top_indices = mx.argpartition(-weights, kth=k, axis=-1)[..., :k]  # (n_heads, k)
+    outputs = _sparse_v_matvec(
+        inputs=[
+            weights.astype(mx.float32).reshape(n_heads * seq_len),
+            v_packed.astype(mx.uint32).reshape(n_heads * seq_len * p_dim),
+            v_norms.astype(mx.float32).reshape(n_heads * seq_len),
+            centroids,
+            signs,
+            scale,
+            thr,
+            dims_arr,
+        ],
+        template=[("T", mx.float32)],
+        grid=(n_heads * dim, 1, 1),
+        threadgroup=(dim, 1, 1),
+        output_shapes=[(n_heads * dim,)],
+        output_dtypes=[mx.float32],
+    )
+    return outputs[0].reshape(n_heads, dim)
 
-    # Gather weights and V for top-K positions
-    top_weights = mx.take_along_axis(weights, top_indices, axis=-1)  # (n_heads, k)
 
-    # Renormalize
-    top_weights = top_weights / top_weights.sum(axis=-1, keepdims=True)
-
-    # Gather V
-    top_indices_exp = top_indices[:, :, None]  # (n_heads, k, 1)
-    top_indices_exp = mx.broadcast_to(top_indices_exp, (n_heads, k, v_deq.shape[-1]))
-    top_v = mx.take_along_axis(v_deq, top_indices_exp, axis=1)  # (n_heads, k, dim)
-
-    return top_weights[:, None, :] @ top_v
-
-
-def count_active_positions(weights: mx.array, threshold: float = 1e-6) -> int:
-    """Count how many positions have weight > threshold."""
-    return (weights > threshold).sum().item()
+def count_active_positions(weights: mx.array, threshold: float = 1e-5) -> int:
+    """Count positions whose weight exceeds `threshold` (diagnostics only)."""
+    return int((weights > threshold).sum().item())
