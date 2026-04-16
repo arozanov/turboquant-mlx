@@ -16,6 +16,7 @@ from turboquant_mlx.metal_kernels_v4 import (
     prerot_fused_qk_scores,
     prerot_packed_dequantize,
 )
+from turboquant_mlx.sparse_v import sparse_v_matvec
 
 
 def turboquant_attention(
@@ -24,6 +25,7 @@ def turboquant_attention(
     attn_scale: float,
     mask=None,
     v_buffer=None,
+    sparse_v_threshold: float | None = None,
 ) -> mx.array:
     """Full attention using pre-rotated query optimization.
 
@@ -31,13 +33,18 @@ def turboquant_attention(
       1. Pre-rotate Q: Q_rot = WHT(signs * Q)  — once, O(d log d)
       2. Q_rot @ codebook[K_indices] — no WHT, O(seq_len * d)
       3. Softmax
-      4. Dequant V + weighted sum
+      4. Dequant V + weighted sum (or sparse V if sparse_v_threshold is set)
 
     Args:
         queries: (B, n_heads, 1, dim)
         cache: TurboQuantKVCache with packed K/V
         attn_scale: 1/sqrt(dim)
         mask: optional attention mask
+        v_buffer: pre-dequanted V tensor to reuse; disables sparse V.
+        sparse_v_threshold: if set, positions with post-softmax weight below
+            this threshold skip WHT+dequant entirely (see sparse_v.py).
+            Cosine >= 0.999 at 1e-5 on long context. Ignored when v_buffer
+            is provided.
 
     Returns:
         (B, n_heads, 1, dim) attention output
@@ -87,15 +94,29 @@ def turboquant_attention(
 
         weights = mx.softmax(scores, axis=-1)
 
-        # --- V: use pre-dequanted buffer if available, else dequant from packed ---
+        # --- V: sparse path, reuse of pre-dequanted buffer, or full dequant ---
+        v_dim = cache._v_dim
         if v_buffer is not None:
             v_deq = v_buffer[b]  # (n_kv_heads, total, v_dim)
             if n_rep > 1:
                 v_deq = mx.repeat(v_deq, n_rep, axis=0)
+            out = weights[:, None, :] @ v_deq.astype(queries.dtype)
+        elif sparse_v_threshold is not None and sparse_v_threshold >= 0.0:
+            vp = cache.v_packed[b, :, :total, :]
+            vn = cache.v_norms[b, :, :total]
+            if n_rep > 1:
+                vp = mx.repeat(vp, n_rep, axis=0)
+                vn = mx.repeat(vn, n_rep, axis=0)
+            sparse = sparse_v_matvec(
+                weights, vp, vn,
+                cache._v_q.centroids, cache._v_q.signs,
+                v_dim, cache.quant_bits,
+                threshold=sparse_v_threshold,
+            )  # (n_q_heads, v_dim)
+            out = sparse[:, None, :].astype(queries.dtype)
         else:
             vp = cache.v_packed[b, :, :total, :]
             vn = cache.v_norms[b, :, :total]
-            v_dim = cache._v_dim
             vp_flat = vp.reshape(-1, vp.shape[-1])
             vn_flat = vn.reshape(-1)
             v_deq = prerot_packed_dequantize(
@@ -106,8 +127,8 @@ def turboquant_attention(
             ).reshape(n_kv_heads, total, v_dim)
             if n_rep > 1:
                 v_deq = mx.repeat(v_deq, n_rep, axis=0)
+            out = weights[:, None, :] @ v_deq.astype(queries.dtype)
 
-        out = weights[:, None, :] @ v_deq.astype(queries.dtype)
         outputs.append(out)
 
     return mx.stack(outputs, axis=0)

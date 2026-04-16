@@ -87,6 +87,31 @@ def test_full_attention_matches_naive_sdpa():
     assert cos > 0.999, f"fused vs naive SDPA cosine={cos}"
 
 
+def test_fused_attention_with_sparse_v_matches_naive():
+    """Opt-in sparse_v_threshold preserves attention quality at cosine >= 0.999."""
+    bits, B, n_heads, seq_len, dim = 3, 1, 4, 512, 128
+    cache, k_deq, v_deq = _fill_cache(bits, B, n_heads, seq_len, dim)
+
+    query = mx.random.normal(shape=(B, n_heads, 1, dim))
+    scale = 1.0 / math.sqrt(dim)
+
+    naive = mx.fast.scaled_dot_product_attention(
+        query, k_deq, v_deq, scale=scale
+    )
+    sparse = turboquant_attention(
+        query, cache, scale, mask=None, sparse_v_threshold=1e-5,
+    )
+    mx.eval(naive, sparse)
+
+    n_flat = np.array(naive).reshape(-1)
+    s_flat = np.array(sparse).reshape(-1)
+    cos = float(
+        (n_flat @ s_flat)
+        / (np.linalg.norm(n_flat) * np.linalg.norm(s_flat) + 1e-8)
+    )
+    assert cos > 0.999, f"sparse V fused cosine={cos}"
+
+
 @pytest.mark.parametrize("seq_len", [256, 1024, 4096])
 def test_fused_decode_bench(seq_len):
     """Coarse decode-step timing. Non-strict: prints for inspection."""
