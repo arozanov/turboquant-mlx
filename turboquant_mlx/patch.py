@@ -12,28 +12,8 @@ _patched = False
 
 
 def _patched_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
-    """Patched SDPA: hybrid (Apple K + TQ V), fused TQ, or standard."""
+    """Patched SDPA: fused TQ path or standard."""
     from turboquant_mlx.cache import TurboQuantKVCache
-    from turboquant_mlx.hybrid_cache import HybridQuantCache
-
-    # Hybrid path: Apple quantized_matmul for K + sparse_v for V
-    if isinstance(cache, HybridQuantCache) and cache.offset > 0:
-        from turboquant_mlx.hybrid_attention import hybrid_quantized_attention
-        total = cache.offset
-        return hybrid_quantized_attention(
-            queries,
-            q_keys=cache._k_quantized,
-            v_packed=cache._v_tq.v_packed[..., :total, :],
-            v_norms=cache._v_tq.v_norms[..., :total],
-            v_centroids=cache._v_tq._v_q.centroids,
-            v_signs=cache._v_tq._v_q.signs,
-            scale=scale,
-            mask=mask,
-            k_group_size=cache._k_group_size,
-            k_bits=cache._k_bits,
-            v_dim=cache._v_tq._v_dim,
-            v_bits=cache._v_bits,
-        )
 
     # Fused TQ path
     is_decode = queries.shape[2] == 1

@@ -174,7 +174,7 @@ class TurboQuantKVCache:
                     self._v_deq_buf = mx.concatenate([self._v_deq_buf[..., :self._deq_offset, :],
                         mx.zeros((B, H, na - self._deq_alloc, v_dim), dtype=values.dtype)], axis=2)
                     self._deq_alloc = na
-                nv = dequant_fp16(v_pk.reshape(-1, self._v_pdim), v_nrm, self._v_q.centroids, self._v_q.signs, v_dim, self.quant_bits).reshape(B, H, S, v_dim)
+                nv = dequant_fp16(v_pk.reshape(-1, self._v_pdim), v_nrm, self._v_q.centroids, self._v_q.signs, v_dim, self.quant_bits).reshape(B, H, S, v_dim).astype(values.dtype)
                 self._v_deq_buf[..., prev:total, :] = nv
                 self._deq_offset = total
                 return mx.zeros((B, H, total, k_dim), dtype=keys.dtype), self._v_deq_buf[..., :total, :]
@@ -198,8 +198,8 @@ class TurboQuantKVCache:
                     mx.zeros((B, H, na - self._deq_alloc, v_dim), dtype=values.dtype)], axis=2)
                 self._deq_alloc = na
 
-            nk = dequant_fp16(k_pk.reshape(-1, self._k_pdim), k_nrm, self._k_q.centroids, self._k_q.signs, k_dim, self.quant_bits).reshape(B, H, S, k_dim)
-            nv = dequant_fp16(v_pk.reshape(-1, self._v_pdim), v_nrm, self._v_q.centroids, self._v_q.signs, v_dim, self.quant_bits).reshape(B, H, S, v_dim)
+            nk = dequant_fp16(k_pk.reshape(-1, self._k_pdim), k_nrm, self._k_q.centroids, self._k_q.signs, k_dim, self.quant_bits).reshape(B, H, S, k_dim).astype(keys.dtype)
+            nv = dequant_fp16(v_pk.reshape(-1, self._v_pdim), v_nrm, self._v_q.centroids, self._v_q.signs, v_dim, self.quant_bits).reshape(B, H, S, v_dim).astype(values.dtype)
             self._k_deq_buf[..., prev:total, :] = nk
             self._v_deq_buf[..., prev:total, :] = nv
             self._deq_offset = total
@@ -342,15 +342,19 @@ class TurboQuantKVCache:
         obj._k_pdim = None
         obj._v_pdim = None
         obj._dtype = None
-        # fused and sparse_v_threshold are runtime flags, not persisted in
-        # state/meta_state; callers that need them must set them after load.
         obj.fused = False
         obj.sparse_v_threshold = None
         obj.v_only = False
-        obj._k_deq_buf = None
-        obj._v_deq_buf = None
-        obj._deq_offset = 0
-        obj._deq_alloc = 0
-        obj.meta_state = meta_state
-        obj.state = state
+        # Restore packed data and metadata from saved state.
+        obj.meta_state = meta_state  # sets offset, quant_bits, seed, dims, dtype
+        obj.state = state            # sets k_packed, k_norms, v_packed, v_norms
+        # Derive packed dims from restored data so _ensure_storage works on extend.
+        if obj.k_packed is not None:
+            obj._k_pdim = obj.k_packed.shape[-1]
+        if obj.v_packed is not None:
+            obj._v_pdim = obj.v_packed.shape[-1]
+        # Lazily initialize quantizers on first update_and_fetch (needs dims
+        # from meta_state which are already set above).
+        if obj._k_dim is not None and obj._v_dim is not None:
+            obj._ensure_quantizer(obj._k_dim, obj._v_dim)
         return obj
