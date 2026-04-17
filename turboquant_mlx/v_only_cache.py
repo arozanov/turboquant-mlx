@@ -40,7 +40,7 @@ class VOnlyTurboQuantCache:
 
     def __init__(self, bits: int = 3, seed: int = 42):
         self._k_cache = KVCache()
-        self._v_tq = TurboQuantKVCache(bits=bits, seed=seed)
+        self._v_tq = TurboQuantKVCache(bits=bits, seed=seed, v_only=True)
         self._v_bits = bits
 
     def update_and_fetch(self, keys, values):

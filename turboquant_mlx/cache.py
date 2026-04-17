@@ -63,16 +63,17 @@ class TurboQuantKVCache:
         seed: int = 42,
         fused: bool = False,
         sparse_v_threshold: float | None = None,
+        v_only: bool = False,
     ):
         self.quant_bits = bits
         self.seed = seed
         self.offset = 0
-        # Opt-in flag read by the fused SDPA monkey-patch (turboquant_mlx.patch);
-        # decoupled from cache data, so it is not persisted in state/meta_state.
         self.fused = fused
-        # Sparse V threshold (see sparse_v.sparse_v_matvec). None -> dense V
-        # path via prerot_packed_dequantize. Only consulted when fused is True.
         self.sparse_v_threshold = sparse_v_threshold
+        # When True, only V is quantized/stored in packed form. K storage
+        # and dequant buffer are skipped entirely to save memory. Used by
+        # VOnlyTurboQuantCache (which handles K separately in fp16).
+        self.v_only = v_only
 
         self.k_packed = None
         self.k_norms = None
@@ -93,7 +94,7 @@ class TurboQuantKVCache:
         self._dtype = None
 
     def _ensure_quantizer(self, k_dim, v_dim):
-        if self._k_q is None:
+        if not self.v_only and self._k_q is None:
             self._k_q = _Quantizer(k_dim, self.quant_bits, self.seed)
             self._k_dim = k_dim
             self._k_pdim = packed_dim(k_dim, self.quant_bits)
@@ -105,23 +106,25 @@ class TurboQuantKVCache:
     def _ensure_storage(self, B, H, num_new):
         prev = self.offset
         needed = prev + num_new
-        if self.k_packed is None or needed > self.k_packed.shape[2]:
+        if self.v_packed is None or needed > self.v_packed.shape[2]:
             n = ((needed + self.step - 1) // self.step) * self.step
-            if self.k_packed is not None:
-                # Allocate new buffer and copy old data into it
-                new_kp = mx.zeros((B, H, n, self._k_pdim), dtype=mx.uint32)
-                new_kn = mx.zeros((B, H, n), dtype=mx.float32)
+            if not self.v_only:
+                if self.k_packed is not None:
+                    new_kp = mx.zeros((B, H, n, self._k_pdim), dtype=mx.uint32)
+                    new_kn = mx.zeros((B, H, n), dtype=mx.float32)
+                    new_kp[..., :prev, :] = self.k_packed[..., :prev, :]
+                    new_kn[..., :prev] = self.k_norms[..., :prev]
+                    self.k_packed, self.k_norms = new_kp, new_kn
+                else:
+                    self.k_packed = mx.zeros((B, H, n, self._k_pdim), dtype=mx.uint32)
+                    self.k_norms = mx.zeros((B, H, n), dtype=mx.float32)
+            if self.v_packed is not None:
                 new_vp = mx.zeros((B, H, n, self._v_pdim), dtype=mx.uint32)
                 new_vn = mx.zeros((B, H, n), dtype=mx.float32)
-                new_kp[..., :prev, :] = self.k_packed[..., :prev, :]
-                new_kn[..., :prev] = self.k_norms[..., :prev]
                 new_vp[..., :prev, :] = self.v_packed[..., :prev, :]
                 new_vn[..., :prev] = self.v_norms[..., :prev]
-                self.k_packed, self.k_norms = new_kp, new_kn
                 self.v_packed, self.v_norms = new_vp, new_vn
             else:
-                self.k_packed = mx.zeros((B, H, n, self._k_pdim), dtype=mx.uint32)
-                self.k_norms = mx.zeros((B, H, n), dtype=mx.float32)
                 self.v_packed = mx.zeros((B, H, n, self._v_pdim), dtype=mx.uint32)
                 self.v_norms = mx.zeros((B, H, n), dtype=mx.float32)
 
@@ -139,16 +142,19 @@ class TurboQuantKVCache:
         self._ensure_storage(B, H, S)
         prev = self.offset
 
-        # Fused Metal quantize
-        k_pk, k_nrm = fused_quantize(keys.reshape(-1, k_dim), self._k_q.signs, self._k_q.boundaries, k_dim, self.quant_bits)
-        k_pk = k_pk.reshape(B, H, S, self._k_pdim)
+        # Quantize V (always)
         v_pk, v_nrm = fused_quantize(values.reshape(-1, v_dim), self._v_q.signs, self._v_q.boundaries, v_dim, self.quant_bits)
         v_pk = v_pk.reshape(B, H, S, self._v_pdim)
-
-        self.k_packed[..., prev:prev+S, :] = k_pk
-        self.k_norms[..., prev:prev+S] = k_nrm.reshape(B, H, S)
         self.v_packed[..., prev:prev+S, :] = v_pk
         self.v_norms[..., prev:prev+S] = v_nrm.reshape(B, H, S)
+
+        # Quantize K (skip in v_only mode — saves one fused_quantize + storage)
+        if not self.v_only:
+            k_pk, k_nrm = fused_quantize(keys.reshape(-1, k_dim), self._k_q.signs, self._k_q.boundaries, k_dim, self.quant_bits)
+            k_pk = k_pk.reshape(B, H, S, self._k_pdim)
+            self.k_packed[..., prev:prev+S, :] = k_pk
+            self.k_norms[..., prev:prev+S] = k_nrm.reshape(B, H, S)
+
         self.offset += S
         total = self.offset
 
@@ -164,6 +170,30 @@ class TurboQuantKVCache:
             placeholder_v = mx.zeros((B, H, total, v_dim), dtype=values.dtype)
             return placeholder_k, placeholder_v
 
+        # v_only mode: K is handled externally (e.g., VOnlyTurboQuantCache
+        # stores K in a plain KVCache). Only dequant V and return it. K
+        # return is a placeholder — caller must not use it.
+        if self.v_only:
+            if S <= 4 and self._v_deq_buf is not None and self._deq_offset == prev:
+                if total > self._deq_alloc:
+                    na = ((total + self.step - 1) // self.step) * self.step
+                    self._v_deq_buf = mx.concatenate([self._v_deq_buf[..., :self._deq_offset, :],
+                        mx.zeros((B, H, na - self._deq_alloc, v_dim), dtype=values.dtype)], axis=2)
+                    self._deq_alloc = na
+                nv = dequant_fp16(v_pk.reshape(-1, self._v_pdim), v_nrm, self._v_q.centroids, self._v_q.signs, v_dim, self.quant_bits).reshape(B, H, S, v_dim)
+                self._v_deq_buf[..., prev:total, :] = nv
+                self._deq_offset = total
+                return mx.zeros((B, H, total, k_dim), dtype=keys.dtype), self._v_deq_buf[..., :total, :]
+            # Full V dequant (prefill)
+            all_v = self._full_dequant(self.v_packed, self.v_norms, self._v_q, v_dim, B, H, total, values.dtype)
+            alloc = ((total + self.step - 1) // self.step) * self.step
+            self._v_deq_buf = mx.zeros((B, H, alloc, v_dim), dtype=values.dtype)
+            self._v_deq_buf[..., :total, :] = all_v
+            self._deq_offset = total
+            self._deq_alloc = alloc
+            return mx.zeros((B, H, total, k_dim), dtype=keys.dtype), all_v
+
+        # Standard K+V path
         # Incremental decode
         if S <= 4 and self._v_deq_buf is not None and self._deq_offset == prev:
             if total > self._deq_alloc:
