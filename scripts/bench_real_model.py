@@ -42,24 +42,6 @@ def _make_long_prompt(tokenizer, target_tokens: int) -> str:
     return out
 
 
-def _decode_tok_per_sec(model, tokenizer, prompt, max_tokens, prompt_cache):
-    sampler = make_sampler(temp=0.0)
-    # Warmup
-    _ = generate(
-        model,
-        tokenizer,
-        prompt=prompt,
-        max_tokens=8,
-        sampler=sampler,
-        prompt_cache=prompt_cache,
-        verbose=False,
-    )
-    mx.eval(mx.array([0]))  # flush
-
-    # Reset: rebuild the cache (generate mutates it in place)
-    #   Caller is responsible for passing a fresh cache; we just time.
-    pass
-
 
 def _run_generate(model, tokenizer, prompt, max_tokens, prompt_cache):
     """Return (prompt_tps, generation_tps, peak_memory_gb, n_tokens).

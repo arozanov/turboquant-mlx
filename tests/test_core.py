@@ -1,8 +1,6 @@
 """Tests for TurboQuant MLX core components."""
 
 import mlx.core as mx
-import sys
-sys.path.insert(0, "/Users/antonrozanov/Projects/turboquant-money/turboquant-mlx")
 
 from turboquant_mlx.rotation import (
     walsh_hadamard_transform,

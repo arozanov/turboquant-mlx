@@ -6,16 +6,10 @@ Bit-packed uint32 storage with fused Metal quantize/dequantize kernels.
 """
 
 import mlx.core as mx
-import math
 from turboquant_mlx.rotation import random_diagonal_sign
-from turboquant_mlx.packing import pack_indices, unpack_indices, packed_dim, VALS_PER_WORD
+from turboquant_mlx.packing import packed_dim
 from turboquant_mlx.metal import fused_quantize, dequant_fp16
 from turboquant_mlx.kernels import packed_dequantize
-
-try:
-    from mlx_lm.models.base import create_attention_mask
-except ImportError:  # standalone usage without mlx-lm installed
-    create_attention_mask = None
 
 
 def _compute_gaussian_codebook(bits):
@@ -224,7 +218,7 @@ class TurboQuantKVCache:
         return all_k, all_v
 
     def empty(self):
-        return self.k_packed is None
+        return self.v_packed is None if self.v_only else self.k_packed is None
 
     @property
     def nbytes(self):
@@ -302,14 +296,6 @@ class TurboQuantKVCache:
     def size(self):
         return self.offset
 
-    @property
-    def state(self):
-        """Compatibility shim for mlx-lm generate internals."""
-        if self.k_packed is None:
-            return []
-        return [self.k_packed[..., :self.offset, :], self.k_norms[..., :self.offset],
-                self.v_packed[..., :self.offset, :], self.v_norms[..., :self.offset]]
-
     def make_mask(self, N, return_array: bool = False, window_size=None):
         """Build the attention mask for a forward of length ``N`` tokens.
 
@@ -354,6 +340,11 @@ class TurboQuantKVCache:
         # state/meta_state; callers that need them must set them after load.
         obj.fused = False
         obj.sparse_v_threshold = None
+        obj.v_only = False
+        obj._k_deq_buf = None
+        obj._v_deq_buf = None
+        obj._deq_offset = 0
+        obj._deq_alloc = 0
         obj.meta_state = meta_state
         obj.state = state
         return obj
