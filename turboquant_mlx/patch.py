@@ -12,23 +12,39 @@ _patched = False
 
 
 def _patched_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
-    """Patched SDPA that uses fused kernel for TurboQuant decode."""
+    """Patched SDPA: hybrid (Apple K + TQ V), fused TQ, or standard."""
     from turboquant_mlx.cache import TurboQuantKVCache
-    from turboquant_mlx.fused_attention import turboquant_attention
+    from turboquant_mlx.hybrid_cache import HybridQuantCache
 
-    # Use fused path only for decode (single query token) with our cache
+    # Hybrid path: Apple quantized_matmul for K + sparse_v for V
+    if isinstance(cache, HybridQuantCache) and cache.offset > 0:
+        from turboquant_mlx.hybrid_attention import hybrid_quantized_attention
+        total = cache.offset
+        return hybrid_quantized_attention(
+            queries,
+            q_keys=cache._k_quantized,
+            v_packed=cache._v_tq.v_packed[..., :total, :],
+            v_norms=cache._v_tq.v_norms[..., :total],
+            v_centroids=cache._v_tq._v_q.centroids,
+            v_signs=cache._v_tq._v_q.signs,
+            scale=scale,
+            mask=mask,
+            k_group_size=cache._k_group_size,
+            k_bits=cache._k_bits,
+            v_dim=cache._v_tq._v_dim,
+            v_bits=cache._v_bits,
+        )
+
+    # Fused TQ path
     is_decode = queries.shape[2] == 1
     is_tq = isinstance(cache, TurboQuantKVCache) and cache.offset > 0 and cache.fused
-
     if is_decode and is_tq:
-        # Ignore the `keys`/`values` args: when cache.fused is on, update_and_fetch
-        # returns empty placeholders (see cache.py lazy-V fast path). Route
-        # directly through turboquant_attention, which reads packed K/V from
-        # the cache and optionally skips V dequant via sparse_v_matvec.
+        from turboquant_mlx.fused_attention import turboquant_attention
         return turboquant_attention(
             queries, cache, scale, mask,
             sparse_v_threshold=cache.sparse_v_threshold,
         )
+
     elif hasattr(cache, "bits"):
         # Original quantized path
         from mlx_lm.models.base import quantized_scaled_dot_product_attention
