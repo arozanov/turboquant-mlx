@@ -135,7 +135,7 @@ pip install -e ../mlx-lm  # or wherever the fork lives
 ## Run Tests
 
 ```bash
-pytest tests/ -v --ignore=tests/test_metal.py --ignore=tests/test_speed.py
+pytest tests/ -v
 # 40 tests, all passing
 ```
 

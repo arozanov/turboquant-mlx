@@ -50,7 +50,8 @@ def make_adaptive_cache(
         if i < fp16_layers or i >= num_layers - fp16_layers:
             caches.append(KVCache())
         else:
+            # k_bits/v_bits reserved for future asymmetric support;
+            # TurboQuantKVCache currently uses a single bit width.
             caches.append(TurboQuantKVCache(
-                bits=bits, k_bits=k_bits, v_bits=v_bits,
-                seed=seed, fused=fused))
+                bits=bits, seed=seed, fused=fused))
     return caches

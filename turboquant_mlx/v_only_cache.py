@@ -88,6 +88,9 @@ class VOnlyTurboQuantCache:
     def make_mask(self, *args, **kwargs):
         return self._k_cache.make_mask(*args, **kwargs)
 
+    def empty(self):
+        return self._k_cache.offset == 0
+
     def is_trimmable(self):
         return True
 

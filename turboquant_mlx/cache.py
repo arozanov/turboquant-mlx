@@ -222,23 +222,25 @@ class TurboQuantKVCache:
 
     @property
     def nbytes(self):
-        if self.k_packed is None:
-            return 0
-        return (self.k_packed[..., :self.offset, :].nbytes + self.v_packed[..., :self.offset, :].nbytes +
-                self.k_norms[..., :self.offset].nbytes + self.v_norms[..., :self.offset].nbytes)
+        total = 0
+        if self.k_packed is not None:
+            total += (self.k_packed[..., :self.offset, :].nbytes +
+                      self.k_norms[..., :self.offset].nbytes)
+        if self.v_packed is not None:
+            total += (self.v_packed[..., :self.offset, :].nbytes +
+                      self.v_norms[..., :self.offset].nbytes)
+        return total
 
     @property
     def compression_ratio(self) -> float:
-        """FP16 bytes of the uncompressed K+V that produced this cache divided
-        by the actual bytes of the packed + norm storage.
-
-        Returns 1.0 for an empty cache. Used by benchmarks and
-        tests/test_core.py::test_cache_compression.
-        """
+        """FP16 bytes of the uncompressed K+V divided by packed + norm bytes."""
         total = self.nbytes
-        if self.k_packed is None or total == 0:
+        if total == 0:
             return 1.0
-        B, H = self.k_packed.shape[0], self.k_packed.shape[1]
+        ref = self.v_packed if self.v_only else self.k_packed
+        if ref is None:
+            return 1.0
+        B, H = ref.shape[0], ref.shape[1]
         k_dim = self._k_dim or 0
         v_dim = self._v_dim or 0
         fp16_bytes = B * H * self.offset * (k_dim + v_dim) * 2
@@ -246,10 +248,14 @@ class TurboQuantKVCache:
 
     @property
     def state(self):
-        if self.k_packed is None:
+        if self.v_packed is None and self.k_packed is None:
             return []
-        return [self.k_packed[..., :self.offset, :], self.k_norms[..., :self.offset],
-                self.v_packed[..., :self.offset, :], self.v_norms[..., :self.offset]]
+        parts = []
+        if self.k_packed is not None:
+            parts += [self.k_packed[..., :self.offset, :], self.k_norms[..., :self.offset]]
+        if self.v_packed is not None:
+            parts += [self.v_packed[..., :self.offset, :], self.v_norms[..., :self.offset]]
+        return parts
 
     @state.setter
     def state(self, v):
