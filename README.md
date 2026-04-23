@@ -140,6 +140,36 @@ pytest tests/ -v
 # 51 tests, all passing
 ```
 
+## Server Integration
+
+The [mlx-lm fork](https://github.com/arozanov/mlx-lm/tree/feature/turboquant-kv-cache) adds KV cache quantization, disk persistence, and MoE support to `mlx_lm.server`.
+
+```bash
+pip install --force-reinstall --no-cache-dir git+https://github.com/arozanov/mlx-lm.git@feature/turboquant-kv-cache
+```
+
+### Server flags
+
+| Flag | Description |
+|------|-------------|
+| `--kv-cache-quantization K,V` | Quantize KV cache: K at K-bit, V at V-bit (e.g. `8,4`) |
+| `--quantized-kv-start N` | Only quantize caches with at least N tokens (skip short prefills) |
+| `--prompt-cache-dir PATH` | Persist prompt caches to disk, survives server restarts |
+| `--no-batch` | Disable batch processing, use single-serve mode |
+
+### Example
+
+```bash
+mlx_lm.server \
+  --model mlx-community/Qwen2.5-7B-Instruct-4bit \
+  --kv-cache-quantization 8,4 \
+  --quantized-kv-start 1024 \
+  --prompt-cache-dir ~/.cache/mlx_kv_cache \
+  --no-batch
+```
+
+Disk cache saves KV caches to disk on every insert. On server restart, caches are loaded from disk on cache miss (lazy loading). Works with MoE models (GLM-5.1, Kimi-K2.6, DeepSeek V3) that use CacheList.
+
 ## References
 
 - **TurboQuant**: [arXiv 2504.19874](https://arxiv.org/abs/2504.19874)
